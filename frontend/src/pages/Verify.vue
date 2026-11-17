@@ -81,6 +81,18 @@ function yuan(cents) {
           <div class="v">{{ yuan(comp.补正向未对消分) }}</div>
         </div>
         <div class="stat">
+          <div class="k">对消证明数</div>
+          <div class="v">{{ comp.对消证明数 }}</div>
+        </div>
+        <div class="stat">
+          <div class="k">边 / 证明一致</div>
+          <div class="v">
+            <span class="tag" :class="comp.边证明一致 ? 'on' : 'bad'">
+              {{ comp.边证明一致 ? '是' : '否' }}
+            </span>
+          </div>
+        </div>
+        <div class="stat">
           <div class="k">流水 / 余额一致</div>
           <div class="v">
             <span class="tag" :class="comp.流水余额一致 ? 'on' : 'bad'">
@@ -108,6 +120,33 @@ function yuan(cents) {
             <td>{{ e.created_at }}</td>
           </tr>
           <tr v-if="!comp.对消边.length"><td colspan="7">尚无补正向对消边</td></tr>
+        </tbody>
+      </table>
+
+      <h2 style="margin-top: 22px">对消证明（只读实体：补正向键 · 冲正键 · 对消分 · 冲正剩余额度）</h2>
+      <p class="note-strip">
+        证明与对消边同事务落库，库级触发器禁止修改 / 删除；只读接口
+        <code>/api/offset-proofs</code> 支持按补正向键或冲正键查询。
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>证明键</th><th>补正向键</th><th>冲正键</th><th>账户</th>
+            <th>对消分（元）</th><th>冲正金额（元）</th><th>对消后剩余额度（元）</th><th>时间</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="p in comp.对消证明" :key="p.id">
+            <td>{{ p.proof_key }}</td>
+            <td>{{ p.forward_entry_key }}</td>
+            <td>{{ p.reverse_entry_key }}</td>
+            <td>{{ p.account_code }}</td>
+            <td>{{ yuan(p.offset_cents) }}</td>
+            <td>{{ yuan(p.reverse_amount_cents) }}</td>
+            <td>{{ yuan(p.reverse_remaining_cents) }}</td>
+            <td>{{ p.created_at }}</td>
+          </tr>
+          <tr v-if="!comp.对消证明.length"><td colspan="8">尚无对消证明</td></tr>
         </tbody>
       </table>
 

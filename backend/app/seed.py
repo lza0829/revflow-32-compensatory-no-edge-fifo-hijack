@@ -39,6 +39,43 @@ CREATE TABLE IF NOT EXISTS offset_edges (
 );
 CREATE INDEX IF NOT EXISTS idx_offset_edges_reverse ON offset_edges(reverse_entry_key);
 
+-- 对消边不可修改、不可删除（只写、不可变）
+CREATE TRIGGER IF NOT EXISTS trg_offset_edges_no_update
+BEFORE UPDATE ON offset_edges
+BEGIN
+  SELECT RAISE(ABORT, '对消边不可修改');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_offset_edges_no_delete
+BEFORE DELETE ON offset_edges
+BEGIN
+  SELECT RAISE(ABORT, '对消边不可删除');
+END;
+
+-- 对消证明实体：与对消边同事务落库的只读证据，按补正向键/冲正键可查。
+-- reverse_remaining_cents 为本次对消后冲正剩余可对消额度的快照。
+CREATE TABLE IF NOT EXISTS offset_proofs (
+  id INTEGER PRIMARY KEY,
+  proof_key TEXT NOT NULL UNIQUE,
+  forward_entry_key TEXT NOT NULL UNIQUE REFERENCES ledger_entries(entry_key),
+  reverse_entry_key TEXT NOT NULL REFERENCES ledger_entries(entry_key),
+  offset_cents INTEGER NOT NULL CHECK (offset_cents > 0),
+  reverse_amount_cents INTEGER NOT NULL,
+  reverse_remaining_cents INTEGER NOT NULL,
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_offset_proofs_reverse ON offset_proofs(reverse_entry_key);
+CREATE TRIGGER IF NOT EXISTS trg_offset_proofs_no_update
+BEFORE UPDATE ON offset_proofs
+BEGIN
+  SELECT RAISE(ABORT, '对消证明不可修改');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_offset_proofs_no_delete
+BEFORE DELETE ON offset_proofs
+BEGIN
+  SELECT RAISE(ABORT, '对消证明不可删除');
+END;
+
 CREATE TRIGGER IF NOT EXISTS trg_compensatory_immutable
 BEFORE UPDATE OF entry_key, account_id, kind, amount_cents, target_entry_key ON ledger_entries
 WHEN EXISTS (SELECT 1 FROM offset_edges o WHERE o.forward_entry_key = OLD.entry_key)

@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
 from app.services import compensatory as svc
@@ -31,6 +31,18 @@ def get_compensatory():
 @router.get("/offset-edges")
 def get_offset_edges():
     return svc.list_offset_edges()
+
+
+@router.get("/offset-proofs")
+def get_offset_proofs(
+    forward_entry_key: str | None = Query(None, description="按补正向键查询"),
+    reverse_entry_key: str | None = Query(None, description="按冲正键查询"),
+):
+    """只读对消证明查询：支持按补正向键或冲正键过滤。"""
+    return svc.list_offset_proofs(
+        forward_entry_key=forward_entry_key,
+        reverse_entry_key=reverse_entry_key,
+    )
 
 
 @router.get("/compensatory-report")

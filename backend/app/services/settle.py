@@ -7,6 +7,8 @@ from fastapi import HTTPException
 
 from app.db import connect, rows_to_dicts
 
+COMPENSATORY = "补正向"
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -46,6 +48,7 @@ def dashboard() -> dict:
             "SELECT COUNT(*) AS c FROM ledger_entries WHERE kind = '补正向'"
         ).fetchone()["c"]
         edges = conn.execute("SELECT COUNT(*) AS c FROM offset_edges").fetchone()["c"]
+        proofs = conn.execute("SELECT COUNT(*) AS c FROM offset_proofs").fetchone()["c"]
         bal = conn.execute("SELECT COALESCE(SUM(balance_cents), 0) AS s FROM accounts").fetchone()["s"]
         last = conn.execute("SELECT * FROM settle_runs ORDER BY id DESC LIMIT 1").fetchone()
         return {
@@ -54,6 +57,7 @@ def dashboard() -> dict:
             "冲正笔数": rev,
             "补正向笔数": comp,
             "对消边数": edges,
+            "对消证明数": proofs,
             "待归并": pending,
             "未平隔离": q,
             "余额合计分": bal,
@@ -172,15 +176,14 @@ def run_settle() -> dict:
         for r in reversals:
             target = r.get("target_entry_key")
             if not target or target not in fwd_by_key:
-                # allow targeting compensatory forwards via broader lookup
+                # 硬约束：补正向已绑定对消边，不得被无关冲正按 FIFO 抢占。
+                # 匹配层直接排除已绑定补正向，此类冲正一律隔离。
                 comp = conn.execute(
                     "SELECT * FROM ledger_entries WHERE entry_key = ? AND kind = '补正向'",
                     (target,),
                 ).fetchone() if target else None
                 if comp:
-                    fwd_by_key[target] = dict(comp)
-                else:
-                    reason = "冲正无原单"
+                    reason = "冲正不得抢占补正向"
                     conn.execute(
                         """
                         INSERT INTO quarantine_items(
@@ -195,6 +198,45 @@ def run_settle() -> dict:
                     )
                     quarantined += 1
                     continue
+                reason = "冲正无原单"
+                conn.execute(
+                    """
+                    INSERT INTO quarantine_items(
+                      entry_key, account_id, reason, amount_cents, settle_run_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (r["entry_key"], r["account_id"], reason, r["amount_cents"], run_id, now),
+                )
+                conn.execute(
+                    "UPDATE ledger_entries SET status = '已隔离', settle_run_id = ? WHERE id = ?",
+                    (run_id, r["id"]),
+                )
+                quarantined += 1
+                continue
+
+            # 防御性兜底：即便补正向键混入匹配字典，也绝不参与 FIFO 占用。
+            if fwd_by_key[target].get("kind") == COMPENSATORY:
+                conn.execute(
+                    """
+                    INSERT INTO quarantine_items(
+                      entry_key, account_id, reason, amount_cents, settle_run_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        r["entry_key"],
+                        r["account_id"],
+                        "冲正不得抢占补正向",
+                        r["amount_cents"],
+                        run_id,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE ledger_entries SET status = '已隔离', settle_run_id = ? WHERE id = ?",
+                    (run_id, r["id"]),
+                )
+                quarantined += 1
+                continue
 
             fwd = fwd_by_key[target]
             if fwd["account_id"] != r["account_id"]:
@@ -358,6 +400,7 @@ def run_verify(settle_run_id: int | None = None) -> dict:
         edge_sum = conn.execute(
             "SELECT COALESCE(SUM(offset_cents), 0) AS s FROM offset_edges"
         ).fetchone()["s"]
+        proof_count = conn.execute("SELECT COUNT(*) AS c FROM offset_proofs").fetchone()["c"]
 
         consistent = 1 if all_ledger_net == all_bal else 0
         detail = {
@@ -372,6 +415,8 @@ def run_verify(settle_run_id: int | None = None) -> dict:
             "补正向金额分": comp_sum,
             "对消边数": edge_count,
             "对消分合计": edge_sum,
+            "对消证明数": proof_count,
+            "边证明一致": proof_count == edge_count,
         }
         now = _now()
         cur = conn.execute(

@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { getJson, postJson } from '../api'
 
 const rows = ref([])
+const proofs = ref([])
 const err = ref('')
 const msg = ref('')
 const busy = ref(false)
@@ -20,10 +21,17 @@ const mergedReversals = ref([])
 
 async function load() {
   rows.value = await getJson('/api/entries?kind=正向')
+  proofs.value = await getJson('/api/offset-proofs')
   mergedReversals.value = (await getJson('/api/entries?kind=冲正')).filter(
     (r) => r.status === '已归并'
   )
 }
+
+const proofByForward = computed(() => {
+  const m = new Map()
+  for (const p of proofs.value) m.set(p.forward_entry_key, p)
+  return m
+})
 
 onMounted(async () => {
   try {
@@ -77,7 +85,7 @@ async function submit() {
       biz_ref: form.value.biz_ref,
       note: form.value.note,
     })
-    msg.value = `补正向 ${r.补正向.entry_key} 已登记并绑定冲正 ${r.补记说明.reverse_entry_key}（对消 ${yuan(r.对消边.offset_cents)}）`
+    msg.value = `补正向 ${r.补正向.entry_key} 已登记，对消边与证明 ${r.对消证明.proof_key} 同事务落库，绑定冲正 ${r.对消边.reverse_entry_key}（对消 ${yuan(r.对消边.offset_cents)}，冲正剩余额度 ${yuan(r.被引用冲正剩余额度分)}）`
     form.value = { reverse_entry_key: '', amount_yuan: '', offset_yuan: '', biz_ref: '', note: '' }
     showForm.value = false
     await load()
@@ -160,7 +168,7 @@ function yuan(cents) {
         <thead>
           <tr>
             <th>流水键</th><th>类型</th><th>账户</th><th>金额（元）</th><th>业务单</th>
-            <th>引用冲正</th><th>对消分</th><th>状态</th><th>入账时间</th>
+            <th>引用冲正</th><th>对消分</th><th>对消证明 / 冲正剩余额度</th><th>状态</th><th>入账时间</th>
           </tr>
         </thead>
         <tbody>
@@ -174,10 +182,43 @@ function yuan(cents) {
             <td>{{ e.biz_ref }}</td>
             <td>{{ e.offset_reverse_key || '—' }}</td>
             <td>{{ e.offset_cents != null ? yuan(e.offset_cents) : '—' }}</td>
+            <td>
+              <template v-if="e.kind === '补正向' && proofByForward.get(e.entry_key)">
+                <span class="tag on">{{ proofByForward.get(e.entry_key).proof_key }}</span>
+                <span class="proof-line">
+                  冲正剩余 {{ yuan(proofByForward.get(e.entry_key).reverse_remaining_cents) }}
+                </span>
+              </template>
+              <span v-else>—</span>
+            </td>
             <td><span class="tag" :class="{ on: e.status === '已归并' }">{{ e.status }}</span></td>
             <td>{{ e.booked_at }}</td>
           </tr>
-          <tr v-if="!rows.length"><td colspan="9">尚无正向流水</td></tr>
+          <tr v-if="!rows.length"><td colspan="10">尚无正向流水</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div v-if="proofs.length" class="panel">
+      <h2>对消证明（只读，与对消边 / 流水 / 余额同源）</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>证明键</th><th>补正向键</th><th>冲正键</th><th>账户</th>
+            <th>对消分（元）</th><th>冲正金额（元）</th><th>对消后剩余额度（元）</th><th>时间</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="p in proofs" :key="p.id">
+            <td>{{ p.proof_key }}</td>
+            <td>{{ p.forward_entry_key }}</td>
+            <td>{{ p.reverse_entry_key }}</td>
+            <td>{{ p.account_code }}</td>
+            <td>{{ yuan(p.offset_cents) }}</td>
+            <td>{{ yuan(p.reverse_amount_cents) }}</td>
+            <td>{{ yuan(p.reverse_remaining_cents) }}</td>
+            <td>{{ p.created_at }}</td>
+          </tr>
         </tbody>
       </table>
     </div>

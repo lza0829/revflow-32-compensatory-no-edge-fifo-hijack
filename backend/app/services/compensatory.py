@@ -2,9 +2,14 @@
 
 补正向 = 归并配平后，发现原正向装载少计而补记的正向；它必须显式引用一笔
 **已归并**冲正，并把「补正向键 ↔ 冲正键 ↔ 对消分」物化为不可变 `offset_edges`
-（不使用 `offset_target` 快照列）。登记成功后补正向立即以「已归并」参与净额，
-并与被引用冲正形成唯一对消边；登记、对消边、余额重算在同一事务内，任一校验
-失败整笔回滚。
+（不使用 `offset_target` 快照列），同时落一条只读对消证明 `offset_proofs`
+（补正向键、冲正键、对消分、冲正剩余额度快照）。
+
+登记采用「同事务原子绑定」路径：同一事务内写补正向 → 写对消边 → 写对消证明，
+随后必须重新读出对消边确认绑定已物化，**缺边则整笔回滚，绝不抬余额**；边在、
+证明在，才允许重算余额并提交。任一校验失败整笔回滚，不留下半截补正向 / 边 /
+证明 / 余额（失败闭）。补正向登记后立即以「已归并」参与净额，且不进入冲正
+FIFO，无关冲正不得抢占（由归并层隔离）。
 """
 
 from __future__ import annotations
@@ -39,6 +44,22 @@ def _next_entry_key(conn: sqlite3.Connection, now: str) -> str:
     if row:
         try:
             seq = int(row["entry_key"].rsplit("-", 1)[1]) + 1
+        except (IndexError, ValueError):
+            seq = 1
+    return f"{prefix}{seq:03d}"
+
+
+def _next_proof_key(conn: sqlite3.Connection, now: str) -> str:
+    day = now[:10].replace("-", "")
+    prefix = f"PRF-{day}-"
+    row = conn.execute(
+        "SELECT proof_key FROM offset_proofs WHERE proof_key LIKE ? ORDER BY proof_key DESC LIMIT 1",
+        (prefix + "%",),
+    ).fetchone()
+    seq = 1
+    if row:
+        try:
+            seq = int(row["proof_key"].rsplit("-", 1)[1]) + 1
         except (IndexError, ValueError):
             seq = 1
     return f"{prefix}{seq:03d}"
@@ -139,6 +160,59 @@ def register(
             )
             entry_id = cur.lastrowid
 
+            # 同一事务物化对消边：补正向键 ↔ 冲正键 ↔ 对消分。边不可改不可删
+            # （库触发器兜底），forward_entry_key 唯一约束保证一笔补正向只有一条边。
+            edge_cur = conn.execute(
+                """
+                INSERT INTO offset_edges(
+                  forward_entry_key, reverse_entry_key, offset_cents,
+                  account_id, reverse_settle_run_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    key,
+                    reverse_entry_key,
+                    offset_cents,
+                    rev["account_id"],
+                    rev["settle_run_id"],
+                    now,
+                ),
+            )
+            edge_id = edge_cur.lastrowid
+
+            # 硬约束：缺边不得抬余额。立刻在同一事务内回读，边未物化即整笔失败闭。
+            edge_row = conn.execute(
+                "SELECT * FROM offset_edges WHERE id = ? AND forward_entry_key = ? AND reverse_entry_key = ?",
+                (edge_id, key, reverse_entry_key),
+            ).fetchone()
+            if edge_row is None:
+                raise _fail(409, "对消边未物化，登记整笔回滚（缺边不得抬余额）")
+
+            remaining_after = _remaining_quota(conn, reverse_entry_key, rev["amount_cents"])
+            if remaining_after < 0:
+                raise _fail(400, "对消后冲正剩余额度为负，登记整笔回滚")
+
+            # 对消证明实体：与边同事务落库，记录本次对消后冲正剩余额度快照。
+            conn.execute(
+                """
+                INSERT INTO offset_proofs(
+                  proof_key, forward_entry_key, reverse_entry_key, offset_cents,
+                  reverse_amount_cents, reverse_remaining_cents, account_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _next_proof_key(conn, now),
+                    key,
+                    reverse_entry_key,
+                    offset_cents,
+                    rev["amount_cents"],
+                    remaining_after,
+                    rev["account_id"],
+                    now,
+                ),
+            )
+
+            # 边与证明都已落库，才允许按全量已归并流水重算余额；前面任一失败均已回滚。
             balance = recompute_account_balance(conn, rev["account_id"])
             conn.commit()
         except HTTPException:
@@ -160,11 +234,15 @@ def register(
             (entry_id,),
         ).fetchone()
         edge = conn.execute(
-            "SELECT * FROM offset_edges WHERE forward_entry_key = ?", (key,)
+            "SELECT * FROM offset_edges WHERE id = ?", (edge_id,)
+        ).fetchone()
+        proof = conn.execute(
+            "SELECT * FROM offset_proofs WHERE forward_entry_key = ?", (key,)
         ).fetchone()
         return {
             "补正向": dict(entry),
             "对消边": dict(edge),
+            "对消证明": dict(proof),
             "账户余额分": balance,
             "被引用冲正剩余额度分": _remaining_quota(conn, reverse_entry_key, rev["amount_cents"]),
         }
@@ -209,6 +287,38 @@ def list_offset_edges() -> list[dict]:
         return rows_to_dicts(rows)
 
 
+def list_offset_proofs(
+    *, forward_entry_key: str | None = None, reverse_entry_key: str | None = None
+) -> list[dict]:
+    """只读对消证明查询：可按补正向键或冲正键过滤；只读，不做任何写操作。"""
+    sql = """
+        SELECT p.*, a.code AS account_code,
+               f.amount_cents AS forward_amount_cents,
+               r.amount_cents AS reverse_amount_cents
+        FROM offset_proofs p
+        JOIN accounts a ON a.id = p.account_id
+        JOIN ledger_entries f ON f.entry_key = p.forward_entry_key
+        JOIN ledger_entries r ON r.entry_key = p.reverse_entry_key
+    """
+    clauses: list[str] = []
+    params: list[str] = []
+    if forward_entry_key:
+        key = forward_entry_key.strip()
+        if key:
+            clauses.append("p.forward_entry_key = ?")
+            params.append(key)
+    if reverse_entry_key:
+        key = reverse_entry_key.strip()
+        if key:
+            clauses.append("p.reverse_entry_key = ?")
+            params.append(key)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY p.id"
+    with connect() as conn:
+        return rows_to_dicts(conn.execute(sql, params).fetchall())
+
+
 def report() -> dict:
     """补正向对消报告：与流水 / 对消边 / 敞口 / 余额同一快照读。
 
@@ -241,6 +351,19 @@ def report() -> dict:
             "SELECT COALESCE(SUM(offset_cents), 0) AS s FROM offset_edges"
         ).fetchone()["s"]
         edge_count = len(edges)
+
+        # 对消证明与边同源：同一快照内证明数必须等于边数
+        proof_rows = rows_to_dicts(
+            conn.execute(
+                """
+                SELECT p.*, a.code AS account_code
+                FROM offset_proofs p
+                JOIN accounts a ON a.id = p.account_id
+                ORDER BY p.id
+                """
+            ).fetchall()
+        )
+        proof_count = conn.execute("SELECT COUNT(*) AS c FROM offset_proofs").fetchone()["c"]
 
         fwd_sum = conn.execute(
             """
@@ -292,6 +415,9 @@ def report() -> dict:
             "对消分合计": edge_sum,
             "补正向未对消分": entry_sum - edge_sum,
             "对消边": edges,
+            "对消证明数": proof_count,
+            "对消证明": proof_rows,
+            "边证明一致": proof_count == edge_count,
             "账户影响": rows_to_dicts(account_rows),
             "引用冲正敞口": [
                 {

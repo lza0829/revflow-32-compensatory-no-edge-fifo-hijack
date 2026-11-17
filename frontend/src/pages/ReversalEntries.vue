@@ -1,16 +1,27 @@
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { getJson } from '../api'
 
 const rows = ref([])
+const proofs = ref([])
 const err = ref('')
 
 onMounted(async () => {
   try {
     rows.value = await getJson('/api/entries?kind=冲正')
+    proofs.value = await getJson('/api/offset-proofs')
   } catch (e) {
     err.value = String(e.message || e)
   }
+})
+
+const proofsByReverse = computed(() => {
+  const m = new Map()
+  for (const p of proofs.value) {
+    if (!m.has(p.reverse_entry_key)) m.set(p.reverse_entry_key, [])
+    m.get(p.reverse_entry_key).push(p)
+  }
+  return m
 })
 
 function yuan(cents) {
@@ -26,7 +37,7 @@ function yuan(cents) {
     <div class="panel">
       <table>
         <thead>
-          <tr><th>流水键</th><th>账户</th><th>金额（元）</th><th>原单键</th><th>业务单</th><th>状态</th><th>对消补记</th></tr>
+          <tr><th>流水键</th><th>账户</th><th>金额（元）</th><th>原单键</th><th>业务单</th><th>状态</th><th>对消补记</th><th>对消证明</th></tr>
         </thead>
         <tbody>
           <tr v-for="e in rows" :key="e.id">
@@ -45,6 +56,23 @@ function yuan(cents) {
               <router-link v-if="e.offset_forward_keys" to="/forward" class="link">
                 补正向 {{ e.offset_forward_keys }} · 对消合计 {{ yuan(e.offset_cents) }}
               </router-link>
+              <span v-else>—</span>
+            </td>
+            <td>
+              <template v-if="proofsByReverse.get(e.entry_key)">
+                <div
+                  v-for="p in proofsByReverse.get(e.entry_key)"
+                  :key="p.id"
+                  class="proof-cell"
+                >
+                  <router-link to="/verify" class="link">
+                    {{ p.proof_key }}
+                  </router-link>
+                  <span class="proof-line">
+                    对消 {{ yuan(p.offset_cents) }} · 剩余额度 {{ yuan(p.reverse_remaining_cents) }}
+                  </span>
+                </div>
+              </template>
               <span v-else>—</span>
             </td>
           </tr>
