@@ -1,0 +1,19 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "10700:10700"
+    volumes:
+      - revflow_data:/data
+      - ./fixtures:/fixtures:ro
+    environment:
+      DATA_DIR: /data
+      FIXTURES_DIR: /fixtures
+  frontend:
+    build: ./frontend
+    ports:
+      - "5700:80"
+    depends_on:
+      - backend
+volumes:
+  revflow_data:
